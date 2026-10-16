@@ -1,0 +1,13 @@
+node_modules/
+auth_session/
+state.json
+qr.png
+
+# Python & PyInstaller build artifacts (keep root Desert.exe and documentation tracked)
+.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/*.egg-info/
+dune_simulator/build/
+dune_simulator/dist/
+*.pyc

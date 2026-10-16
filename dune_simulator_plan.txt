@@ -1,0 +1,445 @@
+================================================================================
+SCIENTIFIC IMPLEMENTATION PLAN: GROUNDED AEOLIAN DUNE SIMULATOR (dune_simulator)
+================================================================================
+
+1. GOAL & OVERVIEW
+------------------
+Build a scientifically validated, modular Python package `dune_simulator` that models 1D and 2D 
+aeolian and subaqueous sand dune morphodynamics (birth, instability, flow separation, equilibrium 
+migration, collision, and planetary scaling).
+
+STRICT IMPLEMENTATION RULES FOR THE CODING AGENT:
+- Use Python >= 3.10, `numpy`, `scipy`, `matplotlib`, and `pytest`.
+- Do NOT use placeholders, `TODO`s, or simplified dummy physics. Implement every equation 
+  and algorithm exactly as specified in Sections 4 and 6.
+- All spatial arrays are 1D `np.ndarray` of shape `(nx,)` or 2D `np.ndarray` of shape `(nx, ny)` 
+  where axis 0 (`x`) is the primary downwind direction (+x) and axis 1 (`y`) is the transverse 
+  direction.
+
+
+2. DIRECTORY & PACKAGE STRUCTURE
+--------------------------------
+Create the package inside `dune_simulator/` as follows:
+
+dune_simulator/
+|-- pyproject.toml
+|-- README.md
+|-- dune_simulator/
+|   |-- __init__.py
+|   |-- core/
+|   |   |-- __init__.py
+|   |   |-- constants.py       # Planetary environments & physical scalings
+|   |   |-- wind.py            # 1D & 2D FFT Jackson-Hunt/Kroy shear stress solver
+|   |   |-- separation.py      # Multi-dune separation bubble streamline & wake mask
+|   |   |-- transport.py       # Saturated flux, exponential relaxation & bedrock limiter
+|   |   |-- avalanche.py       # Mass-conserving cellular slope limiter (1D & 2D)
+|   |   `-- exner.py           # Upwind finite-volume Exner integrator & adaptive dt
+|   |-- simulation/
+|   |   |-- __init__.py
+|   |   |-- config.py          # SimulationConfig, SimulationState dataclasses
+|   |   |-- simulator_1d.py    # DuneSimulator1D engine
+|   |   `-- simulator_2d.py    # DuneSimulator2D engine
+|   |-- presets/
+|   |   |-- __init__.py
+|   |   `-- initial_surfaces.py# 1D & 2D initial topography generators
+|   |-- analysis/
+|   |   |-- __init__.py
+|   |   |-- morphometry.py     # Crest/brink/toe detector, H, L, migration speed c(t)
+|   |   `-- dispersion.py      # Analytical linear stability growth rate sigma(k) & c(k)
+|   `-- visualization/
+|       |-- __init__.py
+|       |-- plots_1d.py        # 3-panel profile/shear/flux plots
+|       |-- plots_2d.py        # 2D hillshade/contour, wind vectors & 3D surface plots
+|       `-- animation.py       # Matplotlib FuncAnimation & GIF/MP4 helpers
+|-- tests/
+|   |-- test_wind_perturbation.py
+|   |-- test_separation_bubble.py
+|   |-- test_flux_saturation.py
+|   |-- test_avalanche.py
+|   |-- test_exner_conservation.py
+|   |-- test_dispersion_relation.py
+|   |-- test_migration_scaling.py
+|   `-- test_planetary_scaling.py
+`-- examples/
+    |-- 01_spontaneous_dune_formation.py
+    |-- 02_gaussian_heap_evolution.py
+    |-- 03_step_topography_response.py
+    |-- 04_barchan_2d_simulation.py
+    `-- 05_planetary_comparison.py
+
+
+3. EXACT MATHEMATICAL & NUMERICAL FORMULATIONS
+----------------------------------------------
+
+3.1 Planetary Parameters & Scalings (`core/constants.py`)
+Given gravity `g` (m/s^2), fluid density `rho_f` (kg/m^3), grain density `rho_s` (kg/m^3), 
+and grain diameter `d` (m):
+- Bulk sand density (with packing fraction phi_p = 0.62):
+    rho_bulk = 0.62 * rho_s
+- Inertial drag length (m):
+    L_drag = (rho_s / rho_f) * d
+- Flux saturation length (Claudin & Andreotti 2006) (m):
+    L_sat = 2.2 * L_drag = 2.2 * (rho_s / rho_f) * d
+- Bagnold threshold friction velocity (m/s) with A_Bagnold = 0.1:
+    u_star_th = 0.1 * sqrt(((rho_s - rho_f) / rho_f) * g * d)
+- Threshold shear stress (Pa):
+    tau_th = rho_f * (u_star_th ** 2)
+- Minimum unstable dune wavelength (m) (with default A=3.2, B=1.6):
+    lambda_min = 2.0 * pi * (A / B) * L_sat = 4.0 * pi * L_sat  (~= 12.57 * L_sat)
+- Fastest-growing emergent wavelength (m):
+    lambda_max ~= 19.78 * L_sat
+
+STANDARD PLANETARY PRESETS TABLE:
+---------------------------------------------------------------------------------------
+Name            g (m/s^2)  rho_f (kg/m^3)  rho_s (kg/m^3)  d (m)      u_star_0 (m/s)
+---------------------------------------------------------------------------------------
+EARTH_DESERT    9.81       1.225           2650.0          200e-6     0.40
+MARS_DUNES      3.71       0.015           3000.0          100e-6     1.80
+VENUS_DUNES     8.87       65.0            2800.0          150e-6     0.06
+AQUEOUS_FLUME   9.81       1000.0          2650.0          200e-6     0.035
+---------------------------------------------------------------------------------------
+Default angles for all presets:
+- `repose_angle_deg = 34.0` (static threshold for avalanche initiation)
+- `dynamic_repose_deg = 32.0` (relaxed angle after avalanche)
+- `separation_angle_deg = 14.0` (lee slope threshold for flow detachment)
+
+
+3.2 Flow Separation Bubble & Aerodynamic Envelope (`core/separation.py`)
+Detachment occurs on lee slopes where the downward slope is steeper than `tan(14 deg)`:
+  s_crit = tan(radians(14.0)) ~= 0.249328
+  s_bar_prime = 0.25
+
+1D MULTI-DUNE SEPARATION ALGORITHM (`compute_separation_1d(h, dx, periodic=True)`):
+1. Reference base height: `h_base = float(np.min(h))`.
+2. Compute forward slope `dh_dx_fwd` and backward (upwind) slope `dh_dx_bwd`:
+   - If `periodic=True`:
+       `dh_dx_fwd = (np.roll(h, -1) - h) / dx`
+       `dh_dx_bwd = (h - np.roll(h, 1)) / dx`
+   - If `periodic=False`:
+       `dh_dx_fwd = np.zeros_like(h); dh_dx_fwd[:-1] = (h[1:] - h[:-1]) / dx; dh_dx_fwd[-1] = dh_dx_fwd[-2]`
+       `dh_dx_bwd = np.zeros_like(h); dh_dx_bwd[1:] = (h[1:] - h[:-1]) / dx; dh_dx_bwd[0] = dh_dx_bwd[1]`
+3. Initialize `h_tilde = h.copy()` and `in_wake = np.zeros(len(h), dtype=bool)`.
+4. March index `i` from `0` to `N - 1`:
+   - If `in_wake[i]` is already True, continue.
+   - Check detachment criterion: `dh_dx_fwd[i] < -s_crit` AND `(h[i] - h_base) > 1e-5`.
+   - If triggered, index `i` is a detachment brink `x_d`:
+     a. Relative brink height: `H_d = h[i] - h_base`.
+     b. Upwind slope at brink (clamped for physical streamline launch):
+        If `dh_dx_bwd[i] < -s_crit` (e.g., sharp step where brink is a single point), use `h_prime_d = 0.0`.
+        Otherwise, clamp `h_prime_d = np.clip(dh_dx_bwd[i], -s_bar_prime, s_bar_prime)`.
+     c. Dimensionless slope parameter: `nu = h_prime_d / s_bar_prime`.
+     d. Separation bubble length (Kroy et al. 2002 Eq. 32):
+        `L_b = (1.5 * H_d / s_bar_prime) * (1.0 + 0.25 * nu + 0.125 * (nu ** 2))`
+        Ensure `L_b = max(L_b, dx)`.
+     e. March downwind step `m = 1, 2, ...` up to `int(np.ceil(L_b / dx))`:
+        - Target grid index: `idx = (i + m) % N` if `periodic` else `i + m`.
+        - If not `periodic` and `idx >= N`, break.
+        - Normalized distance: `z = (m * dx) / L_b` (with `0 < z <= 1`).
+        - Cubic Hermite polynomial relative to `h_base` (satisfies `s(0)=h[i]`, `s'(0)=h_prime_d`, `s(1)=h_base`, `s'(1)=0`):
+          `s_rel = (2.0 * H_d + h_prime_d * L_b) * (z ** 3) - (3.0 * H_d + 2.0 * h_prime_d * L_b) * (z ** 2) + (h_prime_d * L_b) * z + H_d`
+          `s_val = h_base + s_rel`
+        - If `s_val > h[idx]`:
+            `h_tilde[idx] = s_val`
+            `in_wake[idx] = True`
+          Else (streamline reattached early onto rising topography):
+            break out of the inner `m` loop!
+5. Return `(h_tilde, in_wake)`.
+
+2D SEPARATION ALGORITHM (`compute_separation_2d(h, dx, periodic=True)`):
+Apply `compute_separation_1d(h[:, j], dx, periodic=periodic)` independently along each 
+streamwise slice `j in range(ny)`, then optionally apply a 3-point transverse Gaussian 
+smoothing (`scipy.ndimage.gaussian_filter1d(..., sigma=0.5, axis=1)`) to `h_tilde` while 
+enforcing `h_tilde = np.maximum(h, h_tilde)`.
+
+
+3.3 Basal Shear Stress Perturbation via FFT (`core/wind.py`)
+Default aerodynamic constants: `A = 3.2`, `B = 1.6` (Fourriere, Claudin & Andreotti 2010).
+
+1D FORMULATION (`compute_shear_stress_1d`):
+- Inputs: `h_tilde` (shape `(nx,)`), `in_wake` (bool mask), `dx` (float), `tau_0` (float), 
+  `A=3.2`, `B=1.6`, `periodic=True`, `smooth_length=0.0`.
+- If `periodic=False`: pad `h_tilde` symmetrically (`mode="edge"`) by `pad = nx // 2` on 
+  both sides before FFT, and slice back `[pad : pad + nx]` after IFFT.
+- Wavenumber array for `scipy.fft.rfft`:
+    `k = 2.0 * np.pi * scipy.fft.rfftfreq(n_fft, d=dx)`
+- Fourier transform:
+    `h_hat = scipy.fft.rfft(h_tilde_padded)`
+- Optional regularization filter (if `smooth_length > 0`):
+    `filt = np.exp(-0.5 * (k * smooth_length) ** 2)` (else `1.0`)
+- Shear stress perturbation in Fourier space (Note: in SciPy's `exp(-i k x)` convention, 
+  `+i * k * h_hat` is the spatial derivative `dh/dx`, which is positive on the upwind stoss 
+  slope, shifting the shear maximum UPWIND):
+    `tau_pert_hat = (A * np.abs(k) + 1j * B * k) * filt * h_hat`
+    `tau_pert_hat[0] = 0.0`
+- Inverse FFT to spatial domain:
+    `tau_pert = scipy.fft.irfft(tau_pert_hat, n=n_fft)` (slice if padded).
+- Total surface shear stress:
+    `tau = tau_0 * np.maximum(0.0, 1.0 + tau_pert)`
+    `tau[in_wake] = 0.0`
+- Return `(tau, tau_pert)`.
+
+EXACT ANALYTICAL BENCHMARK FOR 1D GAUSSIAN HEAP (for `test_wind_perturbation.py`):
+For a smooth Gaussian heap `h(x) = H * exp(-((x - x0) / R) ** 2)` with no separation bubble:
+Using Dawson's integral `scipy.special.dawsn(z)` where `z = (x - x0) / R`:
+  `hilbert_dh_dx = (2.0 * H / (np.sqrt(np.pi) * R)) * (1.0 - 2.0 * z * scipy.special.dawsn(z))`
+  `dh_dx = -(2.0 * H * z / R) * np.exp(-(z ** 2))`
+  `tau_pert_analytical = A * hilbert_dh_dx + B * dh_dx`
+Provide a helper function `analytical_gaussian_shear_perturbation(x, x0, H, R, A=3.2, B=1.6)` 
+in `core/wind.py` so unit tests can compare FFT output directly against the exact formula.
+
+2D FORMULATION (`compute_shear_stress_2d`):
+- Inputs: `h_tilde` (shape `(nx, ny)`), `in_wake` (shape `(nx, ny)`), `dx`, `dy`, `tau_0`, 
+  `A=3.2`, `B=1.6`, `A_y=1.6`.
+- Wavevectors:
+    `kx = 2.0 * np.pi * scipy.fft.fftfreq(nx, d=dx)[:, np.newaxis]`
+    `ky = 2.0 * np.pi * scipy.fft.rfftfreq(ny, d=dy)[np.newaxis, :]`
+    `k_mag = np.sqrt(kx**2 + ky**2)`
+    `k_mag_safe = np.where(k_mag == 0.0, 1.0, k_mag)`
+- 2D FFT: `h_hat = scipy.fft.rfft2(h_tilde)`
+- Multiplier kernels (Kroy et al. 2002 / Duran 2010):
+    `kernel_x = (kx**2 / k_mag_safe) * A + 1j * B * kx`
+    `kernel_y = (kx * ky / k_mag_safe) * A_y`
+    `kernel_x[0, 0] = 0.0; kernel_y[0, 0] = 0.0`
+- Inverse 2D FFT:
+    `tau_pert_x = scipy.fft.irfft2(kernel_x * h_hat, s=(nx, ny))`
+    `tau_pert_y = scipy.fft.irfft2(kernel_y * h_hat, s=(nx, ny))`
+- Total shear stress components:
+    `tau_x = tau_0 * np.maximum(0.0, 1.0 + tau_pert_x)`
+    `tau_y = tau_0 * tau_pert_y`
+    `tau_x[in_wake] = 0.0; tau_y[in_wake] = 0.0`
+- Return `(tau_x, tau_y, tau_pert_x, tau_pert_y)`.
+
+
+3.4 Saturated Sand Flux & Non-Local Relaxation Solver (`core/transport.py`)
+1. Saturated Mass Flux `q_sat(tau)` (kg / (m * s)) (Lettau & Lettau 1978 / Duran 2010):
+   - Given `tau >= 0` and threshold `tau_th = rho_f * u_star_th**2`:
+   - Friction velocity: `u_star = np.sqrt(np.maximum(0.0, tau) / rho_f)`
+   - For `tau > tau_th`:
+       `q_sat = C_flux * (rho_f / g) * (u_star ** 3) * (1.0 - tau_th / tau)`
+     Else:
+       `q_sat = 0.0`
+     where `C_flux = 4.2` (default).
+
+2. 1D Non-Local Flux Relaxation (`solve_flux_1d`):
+   Solves `L_sat * dq/dx = q_sat - q` using Upwind Exponential Euler with `mu = exp(-dx / L_sat)`:
+   - Unconstrained recurrence:
+       `q[i] = q[i - 1] * mu + q_sat[i] * (1.0 - mu)`
+   - Boundary conditions at `i = 0`:
+     * If `periodic=True`:
+       Run 1st pass starting from `q[0] = q_sat[0]`. Then set `q[0] = q[-1] * mu + q_sat[0] * (1.0 - mu)` 
+       and run a 2nd sweep from `i = 1` to `nx - 1` (since `L_domain >> L_sat`, 2 sweeps converge 
+       periodic boundary flux to `< 1e-12`).
+     * If `periodic=False`:
+       Set incoming flux at upstream boundary: `q[0] = q_inflow` (where `q_inflow = inflow_ratio * q_sat[0]`, 
+       default `inflow_ratio = 0.0` for isolated dunes on bare bedrock, or `1.0` for saturated inflow).
+   - Non-Erodible Bedrock Enforcement (when `enforce_bedrock=True` and `dt is not None`):
+     During the sweep at index `i`, if `h[i] <= 0.0` and `q[i] > q[i - 1]`, sand cannot be eroded 
+     from bare bedrock, so cap:
+       `max_erodible_flux = q[i - 1] + (rho_bulk * dx / dt) * max(0.0, h[i])`
+       `q[i] = min(q[i], max_erodible_flux)`
+
+3. 2D Flux Solver (`solve_flux_2d`):
+   - Compute `tau_mag = np.sqrt(tau_x**2 + tau_y**2)` and `q_sat_mag = compute_saturated_flux(tau_mag, env)`.
+   - Solve 1D relaxation along `x` (axis 0) for each column `j` to get `q_x(x, y)`.
+   - Compute transverse flux `q_y(x, y)` incorporating wind deflection and downslope splash diffusion 
+     (Schwammle & Herrmann 2005; Duran et al. 2010):
+       `dh_dy = central_diff_y(h, dy, periodic=periodic_y)`
+       `q_y = q_x * ((tau_y / tau_0) - D_lat * dh_dy)`
+     where lateral diffusion coefficient `D_lat = 0.5` (dimensionless).
+
+
+3.5 Mass-Conserving Avalanche Slope Limiter (`core/avalanche.py`)
+Relaxes any slope steeper than `theta_stat = 34.0 deg` toward `theta_dyn = 32.0 deg` while 
+strictly conserving `np.sum(h)` to machine precision (`< 1e-13`).
+
+1D VECTORIZED FLUX-CONSERVATIVE AVALANCHE (`avalanche_1d(h, dx, theta_stat_deg=34.0, theta_dyn_deg=32.0, periodic=True, max_iter=2000)`):
+- `s_stat = np.tan(np.radians(theta_stat_deg))`
+- `s_dyn = np.tan(np.radians(theta_dyn_deg))`
+- Copy `h = h.astype(np.float64, copy=True)`.
+- Loop `it` in `range(max_iter)`:
+  1. Compute cell-edge height differences `diff`:
+     - If `periodic=True`: `diff = np.roll(h, -1) - h` (edge `i` connects `i` and `(i+1)%N`)
+     - If `periodic=False`: `diff = h[1:] - h[:-1]` (edge `i` connects `i` and `i+1`)
+  2. Compute local slope magnitude: `slope = np.abs(diff) / dx`.
+  3. Check convergence: if `np.max(slope) <= s_stat + 1e-7`, break!
+  4. Where `slope > s_stat`, compute downslope volume flux `q_edge` across each active edge:
+     `excess = np.maximum(0.0, np.abs(diff) - s_dyn * dx)`
+     `flux_edge = 0.25 * np.sign(diff) * excess` (factor `0.25` guarantees monotone Jacobi stability without overshoot!)
+     If `enforce_bedrock=True`: prevent moving more sand from the higher cell than its height `h`:
+     cap `flux_edge` so neither cell drops below `0.0`.
+  5. Apply conservative edge flux divergence:
+     - If `periodic=True`:
+         `h += flux_edge - np.roll(flux_edge, 1)`
+     - If `periodic=False`:
+         `h[:-1] += flux_edge`
+         `h[1:] -= flux_edge`
+- Return `h` (Note: Because every `flux_edge` added to cell `i` is subtracted from `i+1`, 
+  `np.sum(h)` is algebraically invariant to `< 1e-14`!).
+
+2D VECTORIZED FLUX-CONSERVATIVE AVALANCHE (`avalanche_2d`):
+- On each iteration up to `max_iter=500`, compute edge differences in `x` (`diff_x`) and `y` (`diff_y`), 
+  and total gradient magnitude `grad_mag = np.sqrt((diff_x/dx)**2 + (diff_y/dy)**2)`.
+- Where excess slope exceeds `s_stat`, compute conservative edge fluxes `flux_x` and `flux_y` with 
+  relaxation factor `0.15` (safe for 2D 4-neighbor Jacobi update) and update `h` via 
+  `flux_x - roll(flux_x)` and `flux_y - roll(flux_y)`.
+
+
+3.6 Exner Mass Conservation & Adaptive Time Stepping (`core/exner.py`)
+1. 1D Upwind Flux Divergence (`compute_flux_divergence_1d(q, dx, periodic=True)`):
+   - Since wind is along `+x` (`q >= 0`), use **1st-order Backward (Upwind) Difference**:
+     * If `periodic=True`:
+         `div_q = (q - np.roll(q, 1)) / dx`
+     * If `periodic=False`:
+         `div_q = np.zeros_like(q)`
+         `div_q[1:] = (q[1:] - q[:-1]) / dx`
+         `div_q[0] = 0.0` (keep upstream boundary anchor fixed)
+   - Elevation rate of change:
+       `dh_dt = - div_q / rho_bulk`
+
+2. 2D Flux Divergence (`compute_flux_divergence_2d(qx, qy, dx, dy, periodic_x=True, periodic_y=True)`):
+   - `div_qx`: 1st-order upwind backward difference along axis 0 (`x`).
+   - `div_qy`: 2nd-order central difference along axis 1 (`y`) (since `qy` is diffusive/bidirectional).
+   - `dh_dt = - (div_qx + div_qy) / rho_bulk`.
+
+3. Foolproof Adaptive Time Step (`compute_adaptive_dt(dh_dt, dx, cfl=0.2, dt_min=1.0, dt_max=3600.0)`):
+   - Maximum rate of elevation change: `max_rate = float(np.max(np.abs(dh_dt)))`.
+   - If `max_rate < 1e-12`: return `dt_max`.
+   - Maximum allowable bed change in a single step: `dh_max_allowed = cfl * dx * np.tan(np.radians(32.0))`.
+   - `dt = dh_max_allowed / max_rate`
+   - Return `float(np.clip(dt, dt_min, dt_max))`.
+
+4. Exner Step Update (`exner_step_1d` / `exner_step_2d`):
+   - `h_new = h + dt * dh_dt`
+   - If `enforce_bedrock=True`: `h_new = np.maximum(0.0, h_new)`.
+
+
+4. SIMULATION ENGINES, PRESETS & ANALYSIS SPECIFICATIONS
+--------------------------------------------------------
+
+4.1 Configuration & State (`simulation/config.py`)
+- `@dataclass class SimulationConfig1D`:
+    `nx: int = 512`
+    `length_m: float = 200.0`
+    `env: PlanetaryEnvironment = EARTH_DESERT`
+    `u_star_0: float = 0.40`
+    `A: float = 3.2`
+    `B: float = 1.6`
+    `periodic: bool = True`
+    `inflow_ratio: float = 0.0`
+    `enforce_bedrock: bool = False`
+    `cfl: float = 0.25`
+    `dt_max: float = 1800.0`
+    Property `dx -> float`: `self.length_m / self.nx`
+    Property `tau_0 -> float`: `self.env.fluid_density * (self.u_star_0 ** 2)`
+
+- `@dataclass class SimulationState1D`:
+    `time_s: float`
+    `step_count: int`
+    `x: np.ndarray`
+    `h: np.ndarray`
+    `h_tilde: np.ndarray`
+    `in_wake: np.ndarray`
+    `tau: np.ndarray`
+    `q_sat: np.ndarray`
+    `q: np.ndarray`
+    Properties: `time_days`, `crest_height`, `crest_x`, `mass_volume`.
+
+4.2 Linear Stability Dispersion Relation (`analysis/dispersion.py`)
+Given wavenumber `k` (rad/m), `env`, `tau_0`, `A=3.2`, `B=1.6`:
+1. Compute linearized flux sensitivity `Q_1 = tau_0 * (dq_sat / dtau)|_{tau_0}`:
+   For `tau_0 > tau_th`:
+     `u_star_0 = sqrt(tau_0 / rho_f)`
+     `q_sat_0 = C_flux * (rho_f / g) * (u_star_0 ** 3) * (1.0 - tau_th / tau_0)`
+     `Q_1 = C_flux * (rho_f / g) * (u_star_0 ** 3) * (1.5 - 0.5 * (tau_th / tau_0))`
+2. Exact growth rate `sigma(k)` (1/s) and migration speed `c(k)` (m/s) from Fourier-linearized 
+   system (`L_sat * dq/dx = q_sat - q` and `dh/dt = -(1/rho_bulk) * dq/dx`):
+     `sigma(k) = (Q_1 / rho_bulk) * (k**2 * (B - A * np.abs(k) * L_sat)) / (1.0 + (k * L_sat)**2)`
+     `c(k) = (Q_1 / rho_bulk) * (np.abs(k) * (A + B * np.abs(k) * L_sat)) / (1.0 + (k * L_sat)**2)`
+3. Theoretical neutral stability wavenumber & wavelength:
+     `k_cut = B / (A * L_sat)`
+     `lambda_min = 2.0 * np.pi / k_cut = 2.0 * np.pi * (A / B) * L_sat`
+4. Theoretical fastest-growing wavenumber `k_max` & wavelength `lambda_max`:
+   Find `k_max` maximizing `sigma(k)` on `k in (0, k_cut)` via `scipy.optimize.minimize_scalar` 
+   (for `A=3.2, B=1.6`, `k_max * L_sat = 0.31767`, `lambda_max = 19.779 * L_sat`).
+
+
+5. EXACT VERIFICATION & UNIT TEST SPECIFICATIONS (`tests/`)
+-----------------------------------------------------------
+Implement all 8 test files below and verify with `uv run pytest dune_simulator/tests -v`:
+
+1. `tests/test_wind_perturbation.py`:
+   - Test 1 (Analytical Gaussian Benchmark): Create periodic grid `N=1024, L=200.0`, Gaussian heap 
+     `H=1.0, R=15.0` centered at `x0=100.0`. Compute `tau_pert` via `compute_shear_stress_1d` 
+     (with `in_wake=False`) and compare with `analytical_gaussian_shear_perturbation`. 
+     Assert relative L2 error `np.linalg.norm(tau_pert - tau_exact) / np.linalg.norm(tau_exact) < 1e-3` (< 0.1%).
+   - Test 2 (Upwind Phase Shift): Confirm peak of `tau` occurs strictly upwind of `x0` (`x_peak < x0`), 
+     and on a single cosine mode `h(x) = 0.5 * cos(k * (x - x0))`, the peak shift matches 
+     `x_peak - x0 == -np.arctan(B / A) / k` within `1.5 * dx`.
+
+2. `tests/test_separation_bubble.py`:
+   - Create a flat-topped steep backward step of height `H = 2.0 m` dropping at `x_d = 50.0 m` 
+     onto a flat base `h_base = 1.0 m` (so relative step height `H_d = 2.0 m`, upwind slope `h'_d = 0.0`).
+   - Run `compute_separation_1d`.
+   - Assert bubble reattachment length `L_b` equals `6.0 * H_d = 12.0 m` within `1.5 * dx`.
+   - Assert `tau[in_wake]` is identically `0.0`.
+   - Assert C^0 continuity at brink (`h_tilde[i_brink] == h[i_brink]`) and at reattachment.
+
+3. `tests/test_flux_saturation.py`:
+   - Set uniform `q_sat(x) = 0.05` for `x >= 0` with upstream boundary `q[0] = 0.0` (`periodic=False`).
+   - Solve `solve_flux_1d`.
+   - Compare `q(x)` against exact analytical solution `q_exact(x) = 0.05 * (1.0 - np.exp(-x / L_sat))`.
+   - Assert `np.max(np.abs(q - q_exact)) < 1e-12` (exact to machine precision because Exponential Euler 
+     is the exact analytical integrator for piecewise-constant `q_sat`!).
+
+4. `tests/test_avalanche.py`:
+   - Create an over-steepened Gaussian pile with peak slope `55 deg > 34 deg` on a 1D and 2D grid.
+   - Run `avalanche_1d` and `avalanche_2d`.
+   - Assert final maximum slope `<= np.tan(np.radians(34.0)) + 1e-5`.
+   - Assert total sand mass before and after matches to machine precision:
+     `abs(np.sum(h_after) - np.sum(h_before)) / np.sum(h_before) < 1e-13`.
+
+5. `tests/test_exner_conservation.py`:
+   - Run `DuneSimulator1D` with `periodic=True, enforce_bedrock=False` on a wavy sand bed (`mean(h) = 5.0 m`) 
+     for `1000` steps.
+   - Assert relative conservation of total integral `np.sum(h) * dx` before and after is `< 1e-12`.
+
+6. `tests/test_dispersion_relation.py`:
+   - Verify `dispersion.py`: for `EARTH_DESERT` (`A=3.2, B=1.6`), assert `lambda_min / L_sat` is 
+     `4 * pi ~= 12.566` and `lambda_max / L_sat` is in `[19.0, 20.5]`.
+   - Numerical Linear Growth Test: Initialize a small-amplitude sinusoidal wave `h(x) = h0 + eps * cos(k * x)` 
+     (`eps = 1e-4 m`, no separation, no avalanche) at 5 different wavenumbers `k` spanning unstable and 
+     stable regimes. Take 10 small steps and measure numerical amplitude growth rate `sigma_num(k)`.
+   - Assert `sigma_num(k)` matches analytical `sigma(k)` within `< 2%` relative error.
+
+7. `tests/test_migration_scaling.py`:
+   - Evolve two self-similar asymmetric dunes of heights `H_1 = 3.0 m` and `H_2 = 6.0 m` (with lengths 
+     scaled proportionally `L_1 = 45 m, L_2 = 90 m` so `L >> L_sat`) for enough steps to establish 
+     steady flux and measure their crest/brink migration speeds `c_1` and `c_2` (or verify kinematic 
+     brink speed `c = q_brink / (rho_bulk * H)`).
+   - Assert `(c_1 / c_2)` is within `15%` of `(H_2 / H_1) = 2.0`, and `c * H / (q_crest / rho_bulk)` 
+     is within `10%` of `1.0`.
+
+8. `tests/test_planetary_scaling.py`:
+   - Assert `MARS_DUNES.saturation_length / EARTH_DESERT.saturation_length` is within `[40.0, 50.0]` 
+     (exact value from table is `44.0 / 0.95216 = 46.21`).
+   - Assert `EARTH_DESERT.saturation_length / VENUS_DUNES.saturation_length` is within `[60.0, 75.0]` 
+     (exact value from table is `0.95216 / 0.014215 = 66.98`).
+   - Assert `AQUEOUS_FLUME.saturation_length < 0.002` m (`~ 1.17 mm`).
+
+
+6. EDUCATIONAL EXAMPLES (`examples/`)
+-------------------------------------
+Every script in `examples/` must support a `--headless` or non-interactive Matplotlib backend 
+(`Agg`) and save a high-resolution PNG figure to `examples/output/` so automated verification 
+runs without blocking on GUI windows:
+1. `01_spontaneous_dune_formation.py`: Flat bed (`h0=3.0m`) + `1cm` white noise -> emergent periodic 
+   dune train matching `lambda_max ~= 19.8 * L_sat` + power spectrum evolution plot.
+2. `02_gaussian_heap_evolution.py`: Symmetric Gaussian mound (`H=3.0m`) on flat bed -> stoss flattening, 
+   brink formation, 32-deg slipface, separation wake bubble, and steady downwind migration.
+3. `03_step_topography_response.py`: Forward step & backward step (`periodic=False`) demonstrating 
+   wake recirculation zone (`L_b ~= 6 H`) and lee shadow deposition.
+4. `04_barchan_2d_simulation.py`: 2D `128x128` grid with Gaussian pile on bedrock (`enforce_bedrock=True, 
+   periodic=False, inflow_ratio=0.15`) evolving into a crescentic barchan dune with forward-pointing horns.
+5. `05_planetary_comparison.py`: 4-panel comparison of emergent dune wavelength and `L_sat` across 
+   Earth, Mars, Venus, and Subaqueous flume environments.
+================================================================================

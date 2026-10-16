@@ -1,0 +1,31 @@
+[project]
+name = "dune_simulator"
+version = "0.1.0"
+description = "Grounded physical aeolian and subaqueous sand dune morphodynamics simulator"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "matplotlib>=3.7.0",
+    "pytest>=7.3.0",
+    "pillow>=10.0.0",
+    "PyQt6>=6.5.0",
+    "pyqtgraph>=0.13.0",
+    "PyOpenGL>=3.1.0",
+]
+
+[project.gui-scripts]
+Desert = "dune_simulator.gui.main_window:launch_desert_app"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["dune_simulator*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
